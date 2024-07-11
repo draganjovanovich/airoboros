@@ -60,6 +60,16 @@ OPENAI_MODELS = [
     "gpt-4-0125-preview",
 ]
 
+CLAUDE_MODELS = [
+    "claude-3-5-sonnet-20240620",
+    "claude-3-opus-20240229",
+    "claude-3-sonnet-20240229",
+    "claude-3-haiku-20240307",
+    "claude-2.1",
+    "claude-2.0",
+    "claude-instant-1.2",
+]
+
 # Base URL for vertexai.
 VERTEXAI_BASE_URL = "https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{region}/publishers/{publisher}/models/{model}:predict"
 
@@ -98,18 +108,20 @@ class SelfInstructor:
         self.openai_api_key = raw_config.get("openai_api_key") or os.environ.get(
             "OPENAI_API_KEY"
         )
+        self.anthropic_api_key = raw_config.get("anthropic_api_key") or os.environ.get(
+            "ANTHROPIC_API_KEY"
+        )
+        self.claude_api_url = (
+            raw_config.get("claude_api_url") or "https://api.anthropic.com/v1/complete"
+        )
         if raw_config.get("vertexai_credentials_path"):
             self._vertexai_token = None
             self._vertexai_token_date = None
-            self._vertexai_credentials_path = raw_config[
-                "vertexai_credentials_path"
-            ]
+            self._vertexai_credentials_path = raw_config["vertexai_credentials_path"]
             self._vertexai_region = raw_config.get("vertexai_region", "us-central1")
             self._vertexai_project_id = raw_config["vertexai_project_id"]
-            self._vertexai_publisher = raw_config.get(
-                "vertexai_publisher", "google"
-            )
-        if not self.openai_api_key:
+            self._vertexai_publisher = raw_config.get("vertexai_publisher", "google")
+        if not self.openai_api_key and not self.anthropic_api_key:
             if not raw_config.get("vertexai_credentials_path"):
                 raise ValueError(
                     "OpenAI API key or vertexai_credentials_path must be provided!"
@@ -156,7 +168,9 @@ class SelfInstructor:
         device = raw_config.get("embedding_device", "cpu")
         self.embedding_model = SentenceTransformer(model_name, device=device)
         self.embedding_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.embedding_dimension = self.embedding_model.get_sentence_embedding_dimension()
+        self.embedding_dimension = (
+            self.embedding_model.get_sentence_embedding_dimension()
+        )
         self.index = faiss.IndexFlatL2(self.embedding_dimension)
 
         # Validate the model for each generator.
@@ -167,6 +181,7 @@ class SelfInstructor:
             if config.get("model") and config["model"] not in valid_models:
                 self.validate_model(config["model"])
                 valid_models[config["model"]] = True
+
 
     def initialize_index(self):
         """Initialize the in-memory faiss index to check prompt uniqueness."""
@@ -236,6 +251,21 @@ class SelfInstructor:
         except Exception:
             raise ValueError(f"Error trying to validate vertexai model: {model}")
 
+    def validate_claude_model(self, model):
+        """Ensure the specified Claude model is available."""
+        headers = {"X-API-Key": self.anthropic_api_key, "Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "prompt": "\n\nHuman: Hello, Claude!\n\nAssistant: Hello! I'm Claude, an AI assistant. How can I help you today?",
+            "max_tokens_to_sample": 10,
+        }
+        result = requests.post(self.claude_api_url, headers=headers, json=payload)
+        if result.status_code != 200:
+            raise ValueError(
+                f"Invalid Claude API key or model [{result.status_code}: {result.text}]"
+            )
+        logger.success(f"Successfully validated Claude model: {model}")
+
     def validate_openai_model(self, model):
         """Ensure the specified model is available."""
         headers = {"Authorization": f"Bearer {self.openai_api_key}"}
@@ -255,6 +285,8 @@ class SelfInstructor:
         """Validate a model (openai or vertexai)."""
         if model in OPENAI_MODELS:
             return self.validate_openai_model(model)
+        elif model in CLAUDE_MODELS:
+            return self.validate_claude_model(model)
         return self.validate_vertexai_model(model)
 
     async def initialize_topics(self) -> List[str]:
@@ -362,7 +394,9 @@ class SelfInstructor:
         ),
         max_value=19,
     )
-    async def _post_vertexai(self, model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def _post_vertexai(
+        self, model: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Perform a post request to VertexAI (e.g., Bison/Gemini).
 
         :param model: Model to use, e.g. "bison-text-32k"
@@ -402,7 +436,11 @@ class SelfInstructor:
                         f"Error querying Vertex AI: [{code}]: {await result.text()}"
                     )
                 data = await result.json()
-                if data["predictions"][0].get("safetyAttributes", [{}])[0].get("blocked"):
+                if (
+                    data["predictions"][0]
+                    .get("safetyAttributes", [{}])[0]
+                    .get("blocked")
+                ):
                     raise Exception("Response blocked by vertex.")
                 return data
 
@@ -505,7 +543,10 @@ class SelfInstructor:
         # Make sure our parameters conform to VertexAI specs.
         payload = {**kwargs}
         params = {
-            "maxOutputTokens": payload.pop("max_tokens", payload.pop("maxDecodeSteps", None)) or 2048
+            "maxOutputTokens": payload.pop(
+                "max_tokens", payload.pop("maxDecodeSteps", None)
+            )
+            or 2048
         }
         if "temperature" in payload:
             params["temperature"] = payload.pop("temperature")
@@ -594,11 +635,89 @@ class SelfInstructor:
                 return None
         return text
 
+    async def _post_claude(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Perform a post request to Claude API."""
+        headers = {"X-API-Key": self.anthropic_api_key, "Content-Type": "application/json"}
+        request_id = str(uuid4())
+        logger.debug(f"POST [{request_id}] with payload {json.dumps(payload)}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self.claude_api_url,
+                headers=headers,
+                json=payload,
+                timeout=600.0,
+            ) as result:
+                if result.status != 200:
+                    text = await result.text()
+                    logger.error(f"Claude request error: {text}")
+                    if "too many requests" in text.lower():
+                        raise TooManyRequestsError(text)
+                    if "rate limit" in text.lower():
+                        sleep(30)
+                        raise RateLimitError(text)
+                    elif "context_length_exceeded" in text.lower():
+                        raise ContextLengthExceededError(text)
+                    elif "server_error" in text and "overloaded" in text.lower():
+                        raise ServerOverloadedError(text)
+                    elif (
+                        "bad gateway" in text.lower() or "server_error" in text.lower()
+                    ):
+                        raise ServerError(text)
+                    else:
+                        raise BadResponseError(text)
+                result = await result.json()
+                logger.debug(f"POST [{request_id}] response: {json.dumps(result)}")
+                return result
+
+    async def generate_response_claude(self, instruction: str, **kwargs) -> str:
+        """Call the Claude API with the specified instruction and return the text response."""
+        messages = copy.deepcopy(kwargs.pop("messages", None) or [])
+        filter_response = kwargs.pop("filter_response", True)
+        model = kwargs.get("model", self.model)
+
+        prompt = ""
+        for message in messages:
+            if message["role"] == "system":
+                prompt += f"System: {message['content']}\n\n"
+            elif message["role"] == "human":
+                prompt += f"Human: {message['content']}\n\n"
+            elif message["role"] == "assistant":
+                prompt += f"Assistant: {message['content']}\n\n"
+
+        prompt += f"Human: {instruction}\n\nAssistant:"
+
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens_to_sample": kwargs.get("max_tokens", 2048),
+            "temperature": kwargs.get("temperature", 0.7),
+            "top_p": kwargs.get("top_p", 1),
+            "stop_sequences": ["\n\nHuman:", "\n\nSystem:"],
+        }
+
+        response = await self._post_claude(payload)
+        if not response or not response.get("completion"):
+            return None
+
+        text = response["completion"].strip()
+
+        if filter_response:
+            for banned in self.response_filters:
+                if banned.search(text, re.I):
+                    logger.warning(f"Banned response [{banned}]: {text}")
+                    return None
+            if text.startswith(("I'm sorry,", "Apologies,", "I can't", "I won't")):
+                logger.warning(f"Banned response [apology]: {text}")
+                return None
+        return text
+
     async def generate_response(self, instruction: str, **kwargs) -> str:
-        """Generate a response - wrapper around the openai/vertexai methods above."""
+        """Generate a response - wrapper around the openai/vertexai/claude methods."""
         model = kwargs.pop("model", None) or self.model
         if model in OPENAI_MODELS:
             return await self.generate_response_openai(instruction, **kwargs)
+        elif model in CLAUDE_MODELS:
+            return await self.generate_response_claude(instruction, **kwargs)
         return await self.generate_response_vertexai(instruction, **kwargs)
 
     async def is_decent_response(self, item):
